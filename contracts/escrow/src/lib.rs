@@ -2,6 +2,9 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, token, Address, Bytes, BytesN, Env, Vec};
 
+mod validate_id;
+mod stream;
+
 // TTL thresholds for persistent escrow entries (~57–115 days at 5 s/ledger).
 const TTL_MIN: u32 = 100_000;
 const TTL_MAX: u32 = 200_000;
