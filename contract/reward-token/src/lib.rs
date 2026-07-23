@@ -278,28 +278,6 @@ impl RewardToken {
         env.events().publish(("reward", "burn", from), actual);
     }
 
-    /// Admin-callable burn for reward reclamation on refund/dispute (#847).
-    /// Burns up to `amount` tokens from `from`; if balance < amount the burn is
-    /// capped at the available balance (safe, non-panicking).
-    /// Emits ("reward", "burn", from, actual_amount).
-    pub fn burn_reward(env: Env, from: Address, amount: i128) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        if amount <= 0 {
-            panic!("amount must be positive");
-        }
-        let balance = Self::balance(env.clone(), from.clone());
-        if balance == 0 {
-            return; // nothing to burn
-        }
-        // Cap at available balance (#847 acceptance criterion)
-        let actual = if amount > balance { balance } else { amount };
-        env.storage().persistent().set(&DataKey::Balance(from.clone()), &(balance - actual));
-        let supply: i128 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalSupply, &(supply - actual));
-        env.events().publish(("reward", "burn", from), actual);
-    }
-
     // ── #879: On-chain redemption for marketplace discounts ────────────────────────
 
     /// Default maximum redemption percentage per order (20% = 2000 basis points). (#879)
@@ -963,6 +941,19 @@ mod test {
         let env = Env::default();
         let (client, _admin) = setup_token(&env);
         assert_eq!(client.reward_rate_bps(), 0);
+    }
+
+    #[test]
+    fn test_burn_reward_caps_at_available_balance() {
+        let env = Env::default();
+        let (client, admin, minter) = setup_token(&env);
+        let user = Address::generate(&env);
+        env.mock_auths(&[&minter, &admin]);
+        client.mint(&user, &100);
+        // Attempt to burn 500 tokens when balance is 100; should cap at 100
+        client.burn_reward(&user, &500);
+        assert_eq!(client.balance(&user), 0);
+        assert_eq!(client.total_supply(), 0);
     }
 
     #[test]
