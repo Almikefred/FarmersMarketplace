@@ -83,6 +83,9 @@ pub enum DataKey {
     Platform,
     /// Reward token contract address for minting rewards on release (#851).
     RewardTokenContract,
+    /// Reward rate in basis points (e.g. 100 = 1%). Admin-configurable via
+    /// `set_reward_bps`, falls back to 100 bps when unset. (#953)
+    RewardBps,
     /// Cooperative multisig configuration (members + threshold).
     CoopConfig,
     /// Platform fee in basis points (e.g. 250 = 2.5%). Set by initialize(). (#837)
@@ -539,8 +542,13 @@ impl EscrowContract {
         env.events().publish(("escrow", "release", order_id), farmer_amount);
 
         // #851 — Mint reward tokens for the buyer using try_call (non-blocking)
-        // Calculate reward amount as 1% of the released amount (100 basis points)
-        let reward_amount = (farmer_amount * 100) / 10_000;
+        // Calculate reward amount using the admin-configurable rate (default 1% = 100 bps)
+        let reward_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RewardBps)
+            .unwrap_or(100);
+        let reward_amount = (farmer_amount * reward_bps as i128) / 10_000;
         if let Some(reward_token_address) = env.storage().instance().get(&DataKey::RewardTokenContract) {
             // Use try_invoke to call reward token mint - if it fails, emit event but don't abort release
             let mint_args = soroban_sdk::vec![
@@ -599,6 +607,36 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::MinDeposit)
             .unwrap_or(MIN_DEPOSIT_STROOPS)
+    }
+
+    /// Admin-only: update the reward token mint rate (in basis points) to adjust
+    /// buyer incentives. Must be positive and <= 1000 (10%). (#953)
+    pub fn set_reward_bps(env: Env, reward_bps: u32) -> Result<(), EscrowError> {
+        let admin_transfer: AdminTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::Unauthorized)?;
+        admin_transfer.current_admin.require_auth();
+
+        if reward_bps == 0 || reward_bps > 1000 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        env.storage().instance().set(&DataKey::RewardBps, &reward_bps);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("reward_bps")),
+            reward_bps,
+        );
+        Ok(())
+    }
+
+    /// Read-only view: returns the current reward rate in basis points,
+    /// falling back to 100 bps (1%) when unset. (#953)
+    pub fn get_reward_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RewardBps)
+            .unwrap_or(100)
     }
 
     /// Release many escrows to their farmers in a single transaction. (#856)
