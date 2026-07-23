@@ -734,15 +734,30 @@ impl EscrowContract {
 
     /// Take a snapshot of the current escrow state for `order_id`. (#858)
     ///
-    /// Callable by the Platform/Arbitrator role (the contract admin acts as the
-    /// arbitrator). Returns the ledger sequence the snapshot was stored under.
+    /// Callable by the buyer, farmer, or the Platform/Arbitrator role (admin).
+    /// Returns the ledger sequence the snapshot was stored under.
     pub fn take_snapshot(env: Env, order_id: u64) -> Result<u64, EscrowError> {
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(order_id))
+            .ok_or(EscrowError::NotFound)?;
+
         let admin_transfer: AdminTransfer = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(EscrowError::Unauthorized)?;
-        admin_transfer.current_admin.require_auth();
+
+        let caller = env.invoker();
+        let is_authorized = caller == escrow.buyer
+            || caller == escrow.farmer
+            || caller == admin_transfer.current_admin;
+
+        if !is_authorized {
+            return Err(EscrowError::Unauthorized);
+        }
+
         Self::store_snapshot(&env, order_id)
     }
 
@@ -2412,6 +2427,31 @@ mod test {
         setup_admin_for(&env);
         let result = EscrowContract::take_snapshot(env, 12345);
         assert_eq!(result, Err(EscrowError::NotFound));
+    }
+
+    #[test]
+    fn take_snapshot_allowed_for_buyer_farmer_and_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let buyer = Address::generate(&env);
+        let farmer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let admin = setup_admin_for(&env);
+        store_escrow(&env, 902, buyer.clone(), farmer.clone(), token);
+
+        let seq_by_admin = EscrowContract::take_snapshot(env.clone(), 902).unwrap();
+        let snap = EscrowContract::get_snapshot(env.clone(), 902, seq_by_admin).unwrap();
+        assert_eq!(snap.buyer, buyer);
+
+        store_escrow(&env, 903, buyer.clone(), farmer.clone(), token);
+        let seq_by_buyer = EscrowContract::take_snapshot(env.clone(), 903).unwrap();
+        let snap = EscrowContract::get_snapshot(env.clone(), 903, seq_by_buyer).unwrap();
+        assert_eq!(snap.farmer, farmer);
+
+        store_escrow(&env, 904, buyer.clone(), farmer.clone(), token);
+        let seq_by_farmer = EscrowContract::take_snapshot(env.clone(), 904).unwrap();
+        let snap = EscrowContract::get_snapshot(env, 904, seq_by_farmer).unwrap();
+        assert_eq!(snap.buyer, buyer);
     }
 
     #[test]
