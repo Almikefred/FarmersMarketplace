@@ -212,10 +212,18 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Must be called once to register the platform fee recipient.
-    /// Prefer `initialize()` for new deployments; this is kept for backward compatibility.
-    pub fn init(env: Env, platform_address: Address) {
+    /// Update the platform fee recipient address. Admin-only; can only be called
+    /// after initialize(). Kept for backward compatibility; prefer initialize()
+    /// for new deployments. (#954)
+    pub fn init(env: Env, platform_address: Address) -> Result<(), EscrowError> {
+        let admin_transfer: AdminTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::Unauthorized)?;
+        admin_transfer.current_admin.require_auth();
         env.storage().instance().set(&DataKey::Platform, &platform_address);
+        Ok(())
     }
 
     /// Set the reward token contract address for minting rewards on release (#851).
@@ -570,13 +578,20 @@ impl EscrowContract {
         Ok(())
     }
 
-    pub fn set_admin(env: Env, admin: Address) {
-        admin.require_auth();
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("admin already set");
-        }
+    /// Rotate the admin to a new address. Admin-only; can only be called after
+    /// initialize() has been called (i.e. an admin must already exist). Prevents
+    /// front-running attacks during bootstrap. (#954)
+    pub fn set_admin(env: Env, admin: Address) -> Result<(), EscrowError> {
+        let existing_admin: AdminTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::Unauthorized)?;
+        existing_admin.current_admin.require_auth();
+
         let transfer = AdminTransfer { current_admin: admin, pending_admin: None };
         env.storage().instance().set(&DataKey::Admin, &transfer);
+        Ok(())
     }
 
     /// Admin-only: update the minimum deposit amount (in stroops) to respond to
