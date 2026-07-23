@@ -18,6 +18,11 @@ const MIN_DEPOSIT_STROOPS: i128 = 5_000_000;
 /// keeps the transaction under Stellar's operation limit. (#856)
 const MAX_BATCH_RELEASE: u32 = 20;
 
+/// Maximum number of cooperative signer slots to prevent unbounded loop cost
+/// in multisig_release. Chosen conservatively below Soroban's per-transaction
+/// instruction budget to ensure signature verification remains efficient. (#979)
+const MAX_COOP_SIGNERS: u32 = 15;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -57,6 +62,8 @@ pub enum EscrowError {
     SubmissionWindowClosed = 20,
     /// Auto-release time has not yet been reached. (#878)
     AutoReleaseNotReached  = 21,
+    /// Cooperative signer configuration exceeds maximum allowed. (#979)
+    TooManyCoopSigners     = 22,
     /// Release called before the pre-order unlock date. (#875)
     NotYetReleasable       = 19,
 }
@@ -1262,6 +1269,8 @@ impl EscrowContract {
 
     /// Admin-only: configure cooperative members (ed25519 public keys) and
     /// the minimum signature threshold required for `multisig_release`.
+    /// Number of members is capped at `MAX_COOP_SIGNERS` to prevent unbounded
+    /// loop costs in multisig_release signature verification. (#979)
     pub fn set_coop(
         env: Env,
         members: Vec<BytesN<32>>,
@@ -1273,6 +1282,10 @@ impl EscrowContract {
             .get(&DataKey::Admin)
             .expect("admin not set");
         transfer.current_admin.require_auth();
+
+        if members.len() as u32 > MAX_COOP_SIGNERS {
+            return Err(EscrowError::TooManyCoopSigners);
+        }
 
         let config = CoopConfig { members, threshold };
         env.storage().instance().set(&DataKey::CoopConfig, &config);
@@ -2013,6 +2026,22 @@ mod test {
         let stored: CoopConfig = env.storage().instance().get(&DataKey::CoopConfig).unwrap();
         assert_eq!(stored.threshold, 2);
         assert_eq!(stored.members.len(), 2);
+    }
+
+    #[test]
+    fn set_coop_rejects_too_many_signers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        setup_admin(&env);
+
+        let mut members: Vec<BytesN<32>> = Vec::new(&env);
+        for i in 0u8..=15 {
+            members.push_back(BytesN::from_array(&env, &[i; 32]));
+        }
+        // 16 members exceeds MAX_COOP_SIGNERS (15)
+        let result = EscrowContract::set_coop(env, members, 10);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), EscrowError::TooManyCoopSigners);
     }
 
     #[test]
