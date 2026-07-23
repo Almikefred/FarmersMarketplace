@@ -2692,4 +2692,125 @@ mod test {
         assert_eq!(result.get(0).unwrap(), 1u64);
         assert_eq!(result.get(999).unwrap(), 1000u64);
     }
+
+    // ── Evidence submission cap tests (#956) ────────────────────────────────
+
+    #[test]
+    fn submit_evidence_respects_max_per_party_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let buyer = Address::generate(&env);
+        let farmer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Create a disputed escrow
+        let mut escrow = Escrow {
+            buyer: buyer.clone(),
+            farmer: farmer.clone(),
+            token,
+            amount: 1_000_0000,
+            timeout_unix: 1_000,
+            status: EscrowStatus::Disputed,
+            cooperative_address: None,
+            cooperative_royalty_bps: 0,
+            auto_release_unix: 9_999_999,
+            dispute_opened_at: env.ledger().timestamp(),
+            release_after_unix: 0,
+        };
+        env.storage().persistent().set(&DataKey::Escrow(1), &escrow);
+
+        let evidence_hash = BytesN::<32>::from_array(
+            &env,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        );
+
+        // Submit MAX_EVIDENCE_PER_PARTY evidence entries (should succeed)
+        for i in 0..5 {
+            let mut hash_bytes = [1u8; 32];
+            hash_bytes[0] = i as u8;
+            let hash = BytesN::<32>::from_array(&env, &hash_bytes);
+            let result = EscrowContract::submit_evidence(env.clone(), 1, hash);
+            assert!(result.is_ok(), "submission {} should succeed", i);
+        }
+
+        // 6th submission should fail
+        let mut hash_bytes = [6u8; 32];
+        let hash = BytesN::<32>::from_array(&env, &hash_bytes);
+        let result = EscrowContract::submit_evidence(env.clone(), 1, hash);
+        assert_eq!(result, Err(EscrowError::InvalidAmount));
+    }
+
+    #[test]
+    fn submit_evidence_tracks_buyer_and_farmer_separately() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let buyer = Address::generate(&env);
+        let farmer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Create a disputed escrow
+        let escrow = Escrow {
+            buyer: buyer.clone(),
+            farmer: farmer.clone(),
+            token,
+            amount: 1_000_0000,
+            timeout_unix: 1_000,
+            status: EscrowStatus::Disputed,
+            cooperative_address: None,
+            cooperative_royalty_bps: 0,
+            auto_release_unix: 9_999_999,
+            dispute_opened_at: env.ledger().timestamp(),
+            release_after_unix: 0,
+        };
+        env.storage().persistent().set(&DataKey::Escrow(1), &escrow);
+
+        // Mock buyer auth for buyer submissions
+        env.mock_auths(&[(buyer.clone(), soroban_sdk::InvokeContractArgs {
+            contract_id: env.current_contract_address(),
+            function_name: soroban_sdk::symbol_short!("submit_evidence"),
+            args: soroban_sdk::vec![&env],
+        })]);
+
+        // Submit 5 evidence entries as buyer
+        for i in 0..5 {
+            let mut hash_bytes = [10u8; 32];
+            hash_bytes[0] = i as u8;
+            let hash = BytesN::<32>::from_array(&env, &hash_bytes);
+            let result = EscrowContract::submit_evidence(env.clone(), 1, hash);
+            assert!(result.is_ok(), "buyer submission {} should succeed", i);
+        }
+
+        // Mock farmer auth for farmer submissions
+        env.mock_auths(&[(farmer.clone(), soroban_sdk::InvokeContractArgs {
+            contract_id: env.current_contract_address(),
+            function_name: soroban_sdk::symbol_short!("submit_evidence"),
+            args: soroban_sdk::vec![&env],
+        })]);
+
+        // Submit 5 evidence entries as farmer (should succeed, separate from buyer)
+        for i in 0..5 {
+            let mut hash_bytes = [20u8; 32];
+            hash_bytes[0] = i as u8;
+            let hash = BytesN::<32>::from_array(&env, &hash_bytes);
+            let result = EscrowContract::submit_evidence(env.clone(), 1, hash);
+            assert!(result.is_ok(), "farmer submission {} should succeed", i);
+        }
+
+        // Verify counts
+        let buyer_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BuyerEvidenceCount(1))
+            .unwrap_or(0);
+        let farmer_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FarmerEvidenceCount(1))
+            .unwrap_or(0);
+        assert_eq!(buyer_count, 5);
+        assert_eq!(farmer_count, 5);
+    }
 }
