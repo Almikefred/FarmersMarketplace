@@ -215,14 +215,6 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::Platform, &platform_address);
     }
 
-    /// Deposit funds into escrow for `order_id`. (#838)
-    ///
-    /// Hardening applied in this revision:
-    /// - `amount` must be > 0; returns `EscrowError::InvalidAmount` otherwise.
-    /// - `timeout_unix` is validated using `env.ledger().timestamp() + MIN_TIMEOUT_SECS`.
-    /// - Duplicate `order_id` always returns `AlreadyExists` regardless of settlement state.
-    /// - Emits ("escrow", "deposit", order_id) on success (#471).
-    /// - Extends TTL on the new entry (#688).
     /// Set the reward token contract address for minting rewards on release (#851).
     /// Admin-only operation.
     pub fn set_reward_token(env: Env, reward_token_address: Address) {
@@ -236,7 +228,14 @@ impl EscrowContract {
         env.events().publish(("reward_token_set",), reward_token_address);
     }
 
-    /// Deposit funds into escrow for `order_id`.
+    /// Deposit funds into escrow for `order_id`. (#838)
+    ///
+    /// Hardening applied in this revision:
+    /// - `amount` must be > 0; returns `EscrowError::InvalidAmount` otherwise.
+    /// - `timeout_unix` is validated using `env.ledger().timestamp() + MIN_TIMEOUT_SECS`.
+    /// - Duplicate `order_id` always returns `AlreadyExists` regardless of settlement state.
+    /// - Emits ("escrow", "deposit", order_id) on success (#471).
+    /// - Extends TTL on the new entry (#688).
     ///
     /// `token` is any SAC-compatible token address (#683 — multi-token support).
     /// `cooperative_address` and `cooperative_royalty_bps` are optional; pass
