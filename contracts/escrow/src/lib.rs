@@ -18,6 +18,13 @@ const MIN_DEPOSIT_STROOPS: i128 = 5_000_000;
 /// keeps the transaction under Stellar's operation limit. (#856)
 const MAX_BATCH_RELEASE: u32 = 20;
 
+/// Maximum number of cooperative signer slots to prevent unbounded loop cost
+/// in multisig_release. Chosen conservatively below Soroban's per-transaction
+/// instruction budget to ensure signature verification remains efficient. (#979)
+const MAX_COOP_SIGNERS: u32 = 15;
+/// Maximum limit for paginated escrow queries to prevent excessive read costs. (#980)
+const MAX_ESCROW_PAGE_SIZE: u32 = 100;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -57,6 +64,8 @@ pub enum EscrowError {
     SubmissionWindowClosed = 20,
     /// Auto-release time has not yet been reached. (#878)
     AutoReleaseNotReached  = 21,
+    /// Cooperative signer configuration exceeds maximum allowed. (#979)
+    TooManyCoopSigners     = 22,
     /// Release called before the pre-order unlock date. (#875)
     NotYetReleasable       = 19,
 }
@@ -83,6 +92,9 @@ pub enum DataKey {
     Platform,
     /// Reward token contract address for minting rewards on release (#851).
     RewardTokenContract,
+    /// Reward rate in basis points (e.g. 100 = 1%). Admin-configurable via
+    /// `set_reward_bps`, falls back to 100 bps when unset. (#953)
+    RewardBps,
     /// Cooperative multisig configuration (members + threshold).
     CoopConfig,
     /// Platform fee in basis points (e.g. 250 = 2.5%). Set by initialize(). (#837)
@@ -148,6 +160,14 @@ pub struct Escrow {
     pub release_after_unix: u64,
 }
 
+/// Paginated escrow IDs response. (#980)
+#[contracttype]
+#[derive(Clone)]
+pub struct PaginatedEscrows {
+    pub escrows: Vec<u64>,
+    pub total: u32,
+}
+
 // ---------------------------------------------------------------------------
 // v1 schema — kept for migration purposes only (#691).
 // The original contract stored EscrowRecord (no `status`, no `token` field).
@@ -209,20 +229,20 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Must be called once to register the platform fee recipient.
-    /// Prefer `initialize()` for new deployments; this is kept for backward compatibility.
-    pub fn init(env: Env, platform_address: Address) {
+    /// Update the platform fee recipient address. Admin-only; can only be called
+    /// after initialize(). Kept for backward compatibility; prefer initialize()
+    /// for new deployments. (#954)
+    pub fn init(env: Env, platform_address: Address) -> Result<(), EscrowError> {
+        let admin_transfer: AdminTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::Unauthorized)?;
+        admin_transfer.current_admin.require_auth();
         env.storage().instance().set(&DataKey::Platform, &platform_address);
+        Ok(())
     }
 
-    /// Deposit funds into escrow for `order_id`. (#838)
-    ///
-    /// Hardening applied in this revision:
-    /// - `amount` must be > 0; returns `EscrowError::InvalidAmount` otherwise.
-    /// - `timeout_unix` is validated using `env.ledger().timestamp() + MIN_TIMEOUT_SECS`.
-    /// - Duplicate `order_id` always returns `AlreadyExists` regardless of settlement state.
-    /// - Emits ("escrow", "deposit", order_id) on success (#471).
-    /// - Extends TTL on the new entry (#688).
     /// Set the reward token contract address for minting rewards on release (#851).
     /// Admin-only operation.
     pub fn set_reward_token(env: Env, reward_token_address: Address) {
@@ -236,7 +256,14 @@ impl EscrowContract {
         env.events().publish(("reward_token_set",), reward_token_address);
     }
 
-    /// Deposit funds into escrow for `order_id`.
+    /// Deposit funds into escrow for `order_id`. (#838)
+    ///
+    /// Hardening applied in this revision:
+    /// - `amount` must be > 0; returns `EscrowError::InvalidAmount` otherwise.
+    /// - `timeout_unix` is validated using `env.ledger().timestamp() + MIN_TIMEOUT_SECS`.
+    /// - Duplicate `order_id` always returns `AlreadyExists` regardless of settlement state.
+    /// - Emits ("escrow", "deposit", order_id) on success (#471).
+    /// - Extends TTL on the new entry (#688).
     ///
     /// `token` is any SAC-compatible token address (#683 — multi-token support).
     /// `cooperative_address` and `cooperative_royalty_bps` are optional; pass
@@ -526,8 +553,13 @@ impl EscrowContract {
         );
 
         // #851 — Mint reward tokens for the buyer using try_call (non-blocking)
-        // Calculate reward amount as 1% of the released amount (100 basis points)
-        let reward_amount = (farmer_amount * 100) / 10_000;
+        // Calculate reward amount using the admin-configurable rate (default 1% = 100 bps)
+        let reward_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RewardBps)
+            .unwrap_or(100);
+        let reward_amount = (farmer_amount * reward_bps as i128) / 10_000;
         if let Some(reward_token_address) = env.storage().instance().get(&DataKey::RewardTokenContract) {
             // Use try_invoke to call reward token mint - if it fails, emit event but don't abort release
             let mint_args = soroban_sdk::vec![
@@ -549,13 +581,20 @@ impl EscrowContract {
         Ok(())
     }
 
-    pub fn set_admin(env: Env, admin: Address) {
-        admin.require_auth();
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("admin already set");
-        }
+    /// Rotate the admin to a new address. Admin-only; can only be called after
+    /// initialize() has been called (i.e. an admin must already exist). Prevents
+    /// front-running attacks during bootstrap. (#954)
+    pub fn set_admin(env: Env, admin: Address) -> Result<(), EscrowError> {
+        let existing_admin: AdminTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::Unauthorized)?;
+        existing_admin.current_admin.require_auth();
+
         let transfer = AdminTransfer { current_admin: admin, pending_admin: None };
         env.storage().instance().set(&DataKey::Admin, &transfer);
+        Ok(())
     }
 
     /// Admin-only: update the minimum deposit amount (in stroops) to respond to
@@ -586,6 +625,36 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::MinDeposit)
             .unwrap_or(MIN_DEPOSIT_STROOPS)
+    }
+
+    /// Admin-only: update the reward token mint rate (in basis points) to adjust
+    /// buyer incentives. Must be positive and <= 1000 (10%). (#953)
+    pub fn set_reward_bps(env: Env, reward_bps: u32) -> Result<(), EscrowError> {
+        let admin_transfer: AdminTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::Unauthorized)?;
+        admin_transfer.current_admin.require_auth();
+
+        if reward_bps == 0 || reward_bps > 1000 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        env.storage().instance().set(&DataKey::RewardBps, &reward_bps);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("reward_bps")),
+            reward_bps,
+        );
+        Ok(())
+    }
+
+    /// Read-only view: returns the current reward rate in basis points,
+    /// falling back to 100 bps (1%) when unset. (#953)
+    pub fn get_reward_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RewardBps)
+            .unwrap_or(100)
     }
 
     /// Release many escrows to their farmers in a single transaction. (#856)
@@ -1136,20 +1205,58 @@ impl EscrowContract {
         }
     }
 
-    /// Read-only view: returns the list of order IDs deposited by `buyer`. (#876)
-    pub fn get_buyer_escrows(env: Env, buyer: Address) -> Vec<u64> {
-        env.storage()
+    /// Read-only view: returns paginated list of order IDs deposited by `buyer`. (#876, #980)
+    /// Returns a `PaginatedEscrows` with a page of escrow IDs and total count.
+    /// `limit` is capped at `MAX_ESCROW_PAGE_SIZE` to prevent excessive read costs.
+    pub fn get_buyer_escrows(env: Env, buyer: Address, offset: u32, limit: u32) -> PaginatedEscrows {
+        let all_escrows: Vec<u64> = env.storage()
             .persistent()
             .get(&DataKey::BuyerEscrows(buyer))
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = all_escrows.len() as u32;
+        let capped_limit = core::cmp::min(limit, MAX_ESCROW_PAGE_SIZE);
+        let start = offset as usize;
+        let end = core::cmp::min((offset as usize) + (capped_limit as usize), all_escrows.len());
+
+        let mut page = Vec::new(&env);
+        if start < all_escrows.len() {
+            for i in start..end {
+                page.push_back(all_escrows.get(i as u32).unwrap());
+            }
+        }
+
+        PaginatedEscrows {
+            escrows: page,
+            total,
+        }
     }
 
-    /// Read-only view: returns the list of order IDs for a given `farmer`. (#876)
-    pub fn get_farmer_escrows(env: Env, farmer: Address) -> Vec<u64> {
-        env.storage()
+    /// Read-only view: returns paginated list of order IDs for a given `farmer`. (#876, #980)
+    /// Returns a `PaginatedEscrows` with a page of escrow IDs and total count.
+    /// `limit` is capped at `MAX_ESCROW_PAGE_SIZE` to prevent excessive read costs.
+    pub fn get_farmer_escrows(env: Env, farmer: Address, offset: u32, limit: u32) -> PaginatedEscrows {
+        let all_escrows: Vec<u64> = env.storage()
             .persistent()
             .get(&DataKey::FarmerEscrows(farmer))
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = all_escrows.len() as u32;
+        let capped_limit = core::cmp::min(limit, MAX_ESCROW_PAGE_SIZE);
+        let start = offset as usize;
+        let end = core::cmp::min((offset as usize) + (capped_limit as usize), all_escrows.len());
+
+        let mut page = Vec::new(&env);
+        if start < all_escrows.len() {
+            for i in start..end {
+                page.push_back(all_escrows.get(i as u32).unwrap());
+            }
+        }
+
+        PaginatedEscrows {
+            escrows: page,
+            total,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1248,6 +1355,8 @@ impl EscrowContract {
 
     /// Admin-only: configure cooperative members (ed25519 public keys) and
     /// the minimum signature threshold required for `multisig_release`.
+    /// Number of members is capped at `MAX_COOP_SIGNERS` to prevent unbounded
+    /// loop costs in multisig_release signature verification. (#979)
     pub fn set_coop(
         env: Env,
         members: Vec<BytesN<32>>,
@@ -1259,6 +1368,10 @@ impl EscrowContract {
             .get(&DataKey::Admin)
             .expect("admin not set");
         transfer.current_admin.require_auth();
+
+        if members.len() as u32 > MAX_COOP_SIGNERS {
+            return Err(EscrowError::TooManyCoopSigners);
+        }
 
         let config = CoopConfig { members, threshold };
         env.storage().instance().set(&DataKey::CoopConfig, &config);
@@ -2128,6 +2241,22 @@ mod test {
     }
 
     #[test]
+    fn set_coop_rejects_too_many_signers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        setup_admin(&env);
+
+        let mut members: Vec<BytesN<32>> = Vec::new(&env);
+        for i in 0u8..=15 {
+            members.push_back(BytesN::from_array(&env, &[i; 32]));
+        }
+        // 16 members exceeds MAX_COOP_SIGNERS (15)
+        let result = EscrowContract::set_coop(env, members, 10);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), EscrowError::TooManyCoopSigners);
+    }
+
+    #[test]
     fn multisig_release_coop_not_configured() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2697,29 +2826,33 @@ mod test {
         farmer_ids.push_back(order_id);
         env.storage().persistent().set(&DataKey::FarmerEscrows(farmer.clone()), &farmer_ids);
 
-        let b_ids = EscrowContract::get_buyer_escrows(env.clone(), buyer);
-        assert_eq!(b_ids.len(), 1);
-        assert_eq!(b_ids.get(0).unwrap(), order_id);
+        let b_result = EscrowContract::get_buyer_escrows(env.clone(), buyer, 0, 10);
+        assert_eq!(b_result.escrows.len(), 1);
+        assert_eq!(b_result.total, 1);
+        assert_eq!(b_result.escrows.get(0).unwrap(), order_id);
 
-        let f_ids = EscrowContract::get_farmer_escrows(env, farmer);
-        assert_eq!(f_ids.len(), 1);
-        assert_eq!(f_ids.get(0).unwrap(), order_id);
+        let f_result = EscrowContract::get_farmer_escrows(env, farmer, 0, 10);
+        assert_eq!(f_result.escrows.len(), 1);
+        assert_eq!(f_result.total, 1);
+        assert_eq!(f_result.escrows.get(0).unwrap(), order_id);
     }
 
     #[test]
     fn get_buyer_escrows_empty_when_no_deposits() {
         let env = Env::default();
         let buyer = Address::generate(&env);
-        let ids = EscrowContract::get_buyer_escrows(env, buyer);
-        assert_eq!(ids.len(), 0);
+        let result = EscrowContract::get_buyer_escrows(env, buyer, 0, 10);
+        assert_eq!(result.escrows.len(), 0);
+        assert_eq!(result.total, 0);
     }
 
     #[test]
     fn get_farmer_escrows_empty_when_no_deposits() {
         let env = Env::default();
         let farmer = Address::generate(&env);
-        let ids = EscrowContract::get_farmer_escrows(env, farmer);
-        assert_eq!(ids.len(), 0);
+        let result = EscrowContract::get_farmer_escrows(env, farmer, 0, 10);
+        assert_eq!(result.escrows.len(), 0);
+        assert_eq!(result.total, 0);
     }
 
     #[test]
@@ -2751,5 +2884,161 @@ mod test {
         // oldest (0) was removed, newest (1000) is last
         assert_eq!(result.get(0).unwrap(), 1u64);
         assert_eq!(result.get(999).unwrap(), 1000u64);
+    }
+
+    // ── Evidence submission cap tests (#956) ────────────────────────────────
+
+    #[test]
+    fn submit_evidence_respects_max_per_party_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let buyer = Address::generate(&env);
+        let farmer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Create a disputed escrow
+        let mut escrow = Escrow {
+            buyer: buyer.clone(),
+            farmer: farmer.clone(),
+            token,
+            amount: 1_000_0000,
+            timeout_unix: 1_000,
+            status: EscrowStatus::Disputed,
+            cooperative_address: None,
+            cooperative_royalty_bps: 0,
+            auto_release_unix: 9_999_999,
+            dispute_opened_at: env.ledger().timestamp(),
+            release_after_unix: 0,
+        };
+        env.storage().persistent().set(&DataKey::Escrow(1), &escrow);
+
+        let evidence_hash = BytesN::<32>::from_array(
+            &env,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        );
+
+        // Submit MAX_EVIDENCE_PER_PARTY evidence entries (should succeed)
+        for i in 0..5 {
+            let mut hash_bytes = [1u8; 32];
+            hash_bytes[0] = i as u8;
+            let hash = BytesN::<32>::from_array(&env, &hash_bytes);
+            let result = EscrowContract::submit_evidence(env.clone(), 1, hash);
+            assert!(result.is_ok(), "submission {} should succeed", i);
+        }
+
+        // 6th submission should fail
+        let mut hash_bytes = [6u8; 32];
+        let hash = BytesN::<32>::from_array(&env, &hash_bytes);
+        let result = EscrowContract::submit_evidence(env.clone(), 1, hash);
+        assert_eq!(result, Err(EscrowError::InvalidAmount));
+    }
+
+    #[test]
+    fn submit_evidence_tracks_buyer_and_farmer_separately() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let buyer = Address::generate(&env);
+        let farmer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Create a disputed escrow
+        let escrow = Escrow {
+            buyer: buyer.clone(),
+            farmer: farmer.clone(),
+            token,
+            amount: 1_000_0000,
+            timeout_unix: 1_000,
+            status: EscrowStatus::Disputed,
+            cooperative_address: None,
+            cooperative_royalty_bps: 0,
+            auto_release_unix: 9_999_999,
+            dispute_opened_at: env.ledger().timestamp(),
+            release_after_unix: 0,
+        };
+        env.storage().persistent().set(&DataKey::Escrow(1), &escrow);
+
+        // Mock buyer auth for buyer submissions
+        env.mock_auths(&[(buyer.clone(), soroban_sdk::InvokeContractArgs {
+            contract_id: env.current_contract_address(),
+            function_name: soroban_sdk::symbol_short!("submit_evidence"),
+            args: soroban_sdk::vec![&env],
+        })]);
+
+        // Submit 5 evidence entries as buyer
+        for i in 0..5 {
+            let mut hash_bytes = [10u8; 32];
+            hash_bytes[0] = i as u8;
+            let hash = BytesN::<32>::from_array(&env, &hash_bytes);
+            let result = EscrowContract::submit_evidence(env.clone(), 1, hash);
+            assert!(result.is_ok(), "buyer submission {} should succeed", i);
+        }
+
+        // Mock farmer auth for farmer submissions
+        env.mock_auths(&[(farmer.clone(), soroban_sdk::InvokeContractArgs {
+            contract_id: env.current_contract_address(),
+            function_name: soroban_sdk::symbol_short!("submit_evidence"),
+            args: soroban_sdk::vec![&env],
+        })]);
+
+        // Submit 5 evidence entries as farmer (should succeed, separate from buyer)
+        for i in 0..5 {
+            let mut hash_bytes = [20u8; 32];
+            hash_bytes[0] = i as u8;
+            let hash = BytesN::<32>::from_array(&env, &hash_bytes);
+            let result = EscrowContract::submit_evidence(env.clone(), 1, hash);
+            assert!(result.is_ok(), "farmer submission {} should succeed", i);
+        }
+
+        // Verify counts
+        let buyer_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BuyerEvidenceCount(1))
+            .unwrap_or(0);
+        let farmer_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FarmerEvidenceCount(1))
+            .unwrap_or(0);
+        assert_eq!(buyer_count, 5);
+        assert_eq!(farmer_count, 5);
+    #[test]
+    fn paginated_escrow_returns_expected_page_and_total() {
+        let env = Env::default();
+        let buyer = Address::generate(&env);
+
+        // Create 250 escrow IDs
+        let mut ids: Vec<u64> = Vec::new(&env);
+        for i in 0u64..250 {
+            ids.push_back(i);
+        }
+        env.storage().persistent().set(&DataKey::BuyerEscrows(buyer.clone()), &ids);
+
+        // Test first page
+        let page1 = EscrowContract::get_buyer_escrows(env.clone(), buyer.clone(), 0, 50);
+        assert_eq!(page1.total, 250);
+        assert_eq!(page1.escrows.len(), 50);
+        assert_eq!(page1.escrows.get(0).unwrap(), 0u64);
+        assert_eq!(page1.escrows.get(49).unwrap(), 49u64);
+
+        // Test second page
+        let page2 = EscrowContract::get_buyer_escrows(env.clone(), buyer.clone(), 50, 50);
+        assert_eq!(page2.total, 250);
+        assert_eq!(page2.escrows.len(), 50);
+        assert_eq!(page2.escrows.get(0).unwrap(), 50u64);
+        assert_eq!(page2.escrows.get(49).unwrap(), 99u64);
+
+        // Test limit capped at MAX_ESCROW_PAGE_SIZE
+        let large_page = EscrowContract::get_buyer_escrows(env.clone(), buyer.clone(), 0, 500);
+        assert_eq!(large_page.total, 250);
+        assert_eq!(large_page.escrows.len(), 100);  // Capped at MAX_ESCROW_PAGE_SIZE
+
+        // Test offset beyond total
+        let empty_page = EscrowContract::get_buyer_escrows(env, buyer, 300, 50);
+        assert_eq!(empty_page.total, 250);
+        assert_eq!(empty_page.escrows.len(), 0);
     }
 }
