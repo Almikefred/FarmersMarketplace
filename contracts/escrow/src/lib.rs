@@ -18,6 +18,13 @@ const MIN_DEPOSIT_STROOPS: i128 = 5_000_000;
 /// keeps the transaction under Stellar's operation limit. (#856)
 const MAX_BATCH_RELEASE: u32 = 20;
 
+/// Maximum number of cooperative signer slots to prevent unbounded loop cost
+/// in multisig_release. Chosen conservatively below Soroban's per-transaction
+/// instruction budget to ensure signature verification remains efficient. (#979)
+const MAX_COOP_SIGNERS: u32 = 15;
+/// Maximum limit for paginated escrow queries to prevent excessive read costs. (#980)
+const MAX_ESCROW_PAGE_SIZE: u32 = 100;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -57,6 +64,8 @@ pub enum EscrowError {
     SubmissionWindowClosed = 20,
     /// Auto-release time has not yet been reached. (#878)
     AutoReleaseNotReached  = 21,
+    /// Cooperative signer configuration exceeds maximum allowed. (#979)
+    TooManyCoopSigners     = 22,
     /// Release called before the pre-order unlock date. (#875)
     NotYetReleasable       = 19,
 }
@@ -149,6 +158,14 @@ pub struct Escrow {
     /// Optional pre-order unlock timestamp; if > 0, release() is blocked until
     /// env.ledger().timestamp() >= release_after_unix. (#875)
     pub release_after_unix: u64,
+}
+
+/// Paginated escrow IDs response. (#980)
+#[contracttype]
+#[derive(Clone)]
+pub struct PaginatedEscrows {
+    pub escrows: Vec<u64>,
+    pub total: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1202,20 +1219,58 @@ impl EscrowContract {
         }
     }
 
-    /// Read-only view: returns the list of order IDs deposited by `buyer`. (#876)
-    pub fn get_buyer_escrows(env: Env, buyer: Address) -> Vec<u64> {
-        env.storage()
+    /// Read-only view: returns paginated list of order IDs deposited by `buyer`. (#876, #980)
+    /// Returns a `PaginatedEscrows` with a page of escrow IDs and total count.
+    /// `limit` is capped at `MAX_ESCROW_PAGE_SIZE` to prevent excessive read costs.
+    pub fn get_buyer_escrows(env: Env, buyer: Address, offset: u32, limit: u32) -> PaginatedEscrows {
+        let all_escrows: Vec<u64> = env.storage()
             .persistent()
             .get(&DataKey::BuyerEscrows(buyer))
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = all_escrows.len() as u32;
+        let capped_limit = core::cmp::min(limit, MAX_ESCROW_PAGE_SIZE);
+        let start = offset as usize;
+        let end = core::cmp::min((offset as usize) + (capped_limit as usize), all_escrows.len());
+
+        let mut page = Vec::new(&env);
+        if start < all_escrows.len() {
+            for i in start..end {
+                page.push_back(all_escrows.get(i as u32).unwrap());
+            }
+        }
+
+        PaginatedEscrows {
+            escrows: page,
+            total,
+        }
     }
 
-    /// Read-only view: returns the list of order IDs for a given `farmer`. (#876)
-    pub fn get_farmer_escrows(env: Env, farmer: Address) -> Vec<u64> {
-        env.storage()
+    /// Read-only view: returns paginated list of order IDs for a given `farmer`. (#876, #980)
+    /// Returns a `PaginatedEscrows` with a page of escrow IDs and total count.
+    /// `limit` is capped at `MAX_ESCROW_PAGE_SIZE` to prevent excessive read costs.
+    pub fn get_farmer_escrows(env: Env, farmer: Address, offset: u32, limit: u32) -> PaginatedEscrows {
+        let all_escrows: Vec<u64> = env.storage()
             .persistent()
             .get(&DataKey::FarmerEscrows(farmer))
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = all_escrows.len() as u32;
+        let capped_limit = core::cmp::min(limit, MAX_ESCROW_PAGE_SIZE);
+        let start = offset as usize;
+        let end = core::cmp::min((offset as usize) + (capped_limit as usize), all_escrows.len());
+
+        let mut page = Vec::new(&env);
+        if start < all_escrows.len() {
+            for i in start..end {
+                page.push_back(all_escrows.get(i as u32).unwrap());
+            }
+        }
+
+        PaginatedEscrows {
+            escrows: page,
+            total,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1314,6 +1369,8 @@ impl EscrowContract {
 
     /// Admin-only: configure cooperative members (ed25519 public keys) and
     /// the minimum signature threshold required for `multisig_release`.
+    /// Number of members is capped at `MAX_COOP_SIGNERS` to prevent unbounded
+    /// loop costs in multisig_release signature verification. (#979)
     pub fn set_coop(
         env: Env,
         members: Vec<BytesN<32>>,
@@ -1325,6 +1382,10 @@ impl EscrowContract {
             .get(&DataKey::Admin)
             .expect("admin not set");
         transfer.current_admin.require_auth();
+
+        if members.len() as u32 > MAX_COOP_SIGNERS {
+            return Err(EscrowError::TooManyCoopSigners);
+        }
 
         let config = CoopConfig { members, threshold };
         env.storage().instance().set(&DataKey::CoopConfig, &config);
@@ -2068,6 +2129,22 @@ mod test {
     }
 
     #[test]
+    fn set_coop_rejects_too_many_signers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        setup_admin(&env);
+
+        let mut members: Vec<BytesN<32>> = Vec::new(&env);
+        for i in 0u8..=15 {
+            members.push_back(BytesN::from_array(&env, &[i; 32]));
+        }
+        // 16 members exceeds MAX_COOP_SIGNERS (15)
+        let result = EscrowContract::set_coop(env, members, 10);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), EscrowError::TooManyCoopSigners);
+    }
+
+    #[test]
     fn multisig_release_coop_not_configured() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2637,29 +2714,33 @@ mod test {
         farmer_ids.push_back(order_id);
         env.storage().persistent().set(&DataKey::FarmerEscrows(farmer.clone()), &farmer_ids);
 
-        let b_ids = EscrowContract::get_buyer_escrows(env.clone(), buyer);
-        assert_eq!(b_ids.len(), 1);
-        assert_eq!(b_ids.get(0).unwrap(), order_id);
+        let b_result = EscrowContract::get_buyer_escrows(env.clone(), buyer, 0, 10);
+        assert_eq!(b_result.escrows.len(), 1);
+        assert_eq!(b_result.total, 1);
+        assert_eq!(b_result.escrows.get(0).unwrap(), order_id);
 
-        let f_ids = EscrowContract::get_farmer_escrows(env, farmer);
-        assert_eq!(f_ids.len(), 1);
-        assert_eq!(f_ids.get(0).unwrap(), order_id);
+        let f_result = EscrowContract::get_farmer_escrows(env, farmer, 0, 10);
+        assert_eq!(f_result.escrows.len(), 1);
+        assert_eq!(f_result.total, 1);
+        assert_eq!(f_result.escrows.get(0).unwrap(), order_id);
     }
 
     #[test]
     fn get_buyer_escrows_empty_when_no_deposits() {
         let env = Env::default();
         let buyer = Address::generate(&env);
-        let ids = EscrowContract::get_buyer_escrows(env, buyer);
-        assert_eq!(ids.len(), 0);
+        let result = EscrowContract::get_buyer_escrows(env, buyer, 0, 10);
+        assert_eq!(result.escrows.len(), 0);
+        assert_eq!(result.total, 0);
     }
 
     #[test]
     fn get_farmer_escrows_empty_when_no_deposits() {
         let env = Env::default();
         let farmer = Address::generate(&env);
-        let ids = EscrowContract::get_farmer_escrows(env, farmer);
-        assert_eq!(ids.len(), 0);
+        let result = EscrowContract::get_farmer_escrows(env, farmer, 0, 10);
+        assert_eq!(result.escrows.len(), 0);
+        assert_eq!(result.total, 0);
     }
 
     #[test]
@@ -2812,5 +2893,40 @@ mod test {
             .unwrap_or(0);
         assert_eq!(buyer_count, 5);
         assert_eq!(farmer_count, 5);
+    #[test]
+    fn paginated_escrow_returns_expected_page_and_total() {
+        let env = Env::default();
+        let buyer = Address::generate(&env);
+
+        // Create 250 escrow IDs
+        let mut ids: Vec<u64> = Vec::new(&env);
+        for i in 0u64..250 {
+            ids.push_back(i);
+        }
+        env.storage().persistent().set(&DataKey::BuyerEscrows(buyer.clone()), &ids);
+
+        // Test first page
+        let page1 = EscrowContract::get_buyer_escrows(env.clone(), buyer.clone(), 0, 50);
+        assert_eq!(page1.total, 250);
+        assert_eq!(page1.escrows.len(), 50);
+        assert_eq!(page1.escrows.get(0).unwrap(), 0u64);
+        assert_eq!(page1.escrows.get(49).unwrap(), 49u64);
+
+        // Test second page
+        let page2 = EscrowContract::get_buyer_escrows(env.clone(), buyer.clone(), 50, 50);
+        assert_eq!(page2.total, 250);
+        assert_eq!(page2.escrows.len(), 50);
+        assert_eq!(page2.escrows.get(0).unwrap(), 50u64);
+        assert_eq!(page2.escrows.get(49).unwrap(), 99u64);
+
+        // Test limit capped at MAX_ESCROW_PAGE_SIZE
+        let large_page = EscrowContract::get_buyer_escrows(env.clone(), buyer.clone(), 0, 500);
+        assert_eq!(large_page.total, 250);
+        assert_eq!(large_page.escrows.len(), 100);  // Capped at MAX_ESCROW_PAGE_SIZE
+
+        // Test offset beyond total
+        let empty_page = EscrowContract::get_buyer_escrows(env, buyer, 300, 50);
+        assert_eq!(empty_page.total, 250);
+        assert_eq!(empty_page.escrows.len(), 0);
     }
 }
