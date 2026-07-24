@@ -2,6 +2,9 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, token, Address, Bytes, BytesN, Env, Vec};
 
+mod validate_id;
+mod stream;
+
 // TTL thresholds for persistent escrow entries (~57–115 days at 5 s/ledger).
 const TTL_MIN: u32 = 100_000;
 const TTL_MAX: u32 = 200_000;
@@ -586,6 +589,182 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Release an escrow as a continuous payment stream instead of lump-sum.
+    ///
+    /// The farmer receives `farmer_amount` tokens streamed continuously from this contract
+    /// at `stream_rate_per_second` stroops per second until `stream_end_time` (ledger timestamp).
+    /// Platform fees and cooperative royalties are deducted before streaming, matching
+    /// standard `release()` behavior.
+    ///
+    /// # Authorization
+    /// Only the escrow buyer may call this (see `release()` authorization rules).
+    ///
+    /// # Parameters
+    /// - `order_id`: Escrow ID
+    /// - `platform_fee_bps`: Platform fee rate in basis points (max 1000, i.e., 10%)
+    /// - `stream_rate_per_second`: Streaming rate in stroops/sec (must be > 0)
+    /// - `stream_end_time`: Ledger timestamp when streaming stops (must be > current timestamp)
+    ///
+    /// # Returns
+    /// Stream ID (u64) on success, or EscrowError on validation failure.
+    ///
+    /// # Errors
+    /// - `NotFound`: Order does not exist
+    /// - `AlreadySettled`: Escrow already released or refunded
+    /// - `InDispute`: Escrow is in disputed state
+    /// - `Unauthorized`: Caller is not the buyer
+    /// - `InvalidAmount`: platform_fee_bps > 1000, or stream_rate <= 0, or end_time <= now
+    /// - `NotYetReleasable`: Pre-order unlock date not yet reached (#875)
+    ///
+    /// # Issue Reference
+    /// See issue #973 for design decision and streaming integration rationale.
+    pub fn release_to_stream(
+        env: Env,
+        order_id: u64,
+        platform_fee_bps: u32,
+        stream_rate_per_second: i128,
+        stream_end_time: u64,
+    ) -> Result<u64, EscrowError> {
+        // Validate platform fee
+        if platform_fee_bps > 1000 {
+            return Err(EscrowError::InvalidAmount);
+        }
+
+        // Validate stream parameters
+        let now = env.ledger().timestamp();
+        if stream_rate_per_second <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        if stream_end_time <= now {
+            return Err(EscrowError::InvalidAmount);
+        }
+
+        // Fetch and validate escrow
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(order_id))
+            .ok_or(EscrowError::NotFound)?;
+
+        // Require buyer authorization
+        escrow.buyer.require_auth();
+
+        // Check escrow status
+        match escrow.status {
+            EscrowStatus::Released | EscrowStatus::Refunded => {
+                return Err(EscrowError::AlreadySettled);
+            }
+            EscrowStatus::Disputed => {
+                return Err(EscrowError::InDispute);
+            }
+            EscrowStatus::Active => {}
+        }
+
+        // #875: block release until the pre-order unlock date
+        if escrow.release_after_unix > 0 && now < escrow.release_after_unix {
+            return Err(EscrowError::NotYetReleasable);
+        }
+
+        // Verify the token stored at deposit time matches the escrow record.
+        let stored_token: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Token(order_id))
+            .ok_or(EscrowError::NotFound)?;
+        if stored_token != escrow.token {
+            return Err(EscrowError::InvalidToken);
+        }
+
+        let token_client = token::Client::new(&env, &escrow.token);
+
+        // Use stored fee_bps if initialized, otherwise use the passed parameter.
+        let effective_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(platform_fee_bps);
+
+        let fee_amount = (escrow.amount * effective_bps as i128) / 10_000;
+        let after_fee = escrow.amount - fee_amount;
+
+        // #860: cooperative royalty — deducted from the farmer's portion.
+        let royalty_amount: i128 = match &escrow.cooperative_address {
+            Some(_) => (after_fee * escrow.cooperative_royalty_bps as i128) / 10_000,
+            None => 0,
+        };
+        let farmer_amount = after_fee - royalty_amount;
+
+        // Transfer platform fee
+        if fee_amount > 0 {
+            let fee_dest: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeDestination)
+                .or_else(|| env.storage().instance().get(&DataKey::Platform))
+                .ok_or(EscrowError::NotFound)?;
+            token_client.transfer(&env.current_contract_address(), &fee_dest, &fee_amount);
+        }
+
+        // Transfer cooperative royalty
+        if royalty_amount > 0 {
+            if let Some(ref coop_addr) = escrow.cooperative_address {
+                token_client.transfer(&env.current_contract_address(), coop_addr, &royalty_amount);
+                env.events().publish(
+                    (symbol_short!("escrow"), symbol_short!("royalty"), order_id),
+                    (coop_addr.clone(), royalty_amount),
+                );
+            }
+        }
+
+        // Create payment stream with farmer_amount as initial deposit
+        let stream_id: u64 = order_id; // Use order_id as stream_id for 1:1 correspondence
+        let payment_stream = stream::PaymentStream {
+            sender: env.current_contract_address(),
+            recipient: escrow.farmer.clone(),
+            rate_per_second: stream_rate_per_second,
+            deposit: farmer_amount,
+            accrued_at_checkpoint: 0,
+            last_checkpoint_at: now,
+            end_time: stream_end_time,
+            cancelled: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&stream::StreamKey::Stream(stream_id), &payment_stream);
+        env.storage()
+            .persistent()
+            .extend_ttl(&stream::StreamKey::Stream(stream_id), TTL_MIN, TTL_MAX);
+
+        // Mark escrow as released
+        escrow.status = EscrowStatus::Released;
+        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+
+        // Emit release event (similar to release())
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("release"), order_id),
+            (farmer_amount, fee_amount),
+        );
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("release")),
+            (order_id, farmer_amount, fee_amount),
+        );
+        env.events().publish(("escrow", "release", order_id), farmer_amount);
+
+        // Emit stream creation event
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("stream"), order_id),
+            (stream_rate_per_second, stream_end_time),
+        );
+
+        Ok(stream_id)
+    }
+
+    pub fn set_admin(env: Env, admin: Address) {
+        admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("admin already set");
+        }
     /// Rotate the admin to a new address. Admin-only; can only be called after
     /// initialize() has been called (i.e. an admin must already exist). Prevents
     /// front-running attacks during bootstrap. (#954)
