@@ -13,7 +13,11 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, token, Address, Env, Vec};
+
+/// Maximum number of entries accepted by `batch_credit` in a single call —
+/// keeps the transaction under Stellar's operation limit.
+const MAX_BATCH_CREDIT: u32 = 20;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -31,6 +35,8 @@ pub enum EarningsError {
     ZeroBalance = 3,
     /// Platform address has not been initialised.
     NotInitialised = 4,
+    /// `batch_credit` was called with more than `MAX_BATCH_CREDIT` entries.
+    BatchTooLarge = 5,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +94,40 @@ impl CreatorEarningsContract {
         env.storage().persistent().set(&key, &(prev + farmer_amount));
 
         Ok((farmer_amount, fee_amount))
+    }
+
+    /// Batch credit multiple (creator, amount, fee_bps) tuples in a single call.
+    /// - At most `MAX_BATCH_CREDIT` (20) entries are accepted; otherwise
+    ///   `EarningsError::BatchTooLarge`.
+    /// - Each credit is independent: a failing one emits
+    ///   ("earnings", "batch_credit_error", creator) and the batch continues.
+    /// - Returns one `(creator, succeeded)` pair per input entry, in order.
+    pub fn batch_credit(
+        env: Env,
+        entries: Vec<(Address, i128, u32)>,
+    ) -> Result<Vec<(Address, bool)>, EarningsError> {
+        if entries.len() > MAX_BATCH_CREDIT as usize {
+            return Err(EarningsError::BatchTooLarge);
+        }
+
+        let mut results: Vec<(Address, bool)> = Vec::new(&env);
+        for (creator, amount, fee_bps) in entries.iter() {
+            match Self::credit(env.clone(), creator.clone(), amount, fee_bps) {
+                Ok(_) => results.push_back((creator.clone(), true)),
+                Err(_) => {
+                    env.events().publish(
+                        (
+                            symbol_short!("earnings"),
+                            soroban_sdk::Symbol::new(&env, "batch_credit_error"),
+                            creator.clone(),
+                        ),
+                        (),
+                    );
+                    results.push_back((creator.clone(), false));
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// Transfer the caller's entire accumulated balance to themselves via
@@ -387,5 +427,61 @@ mod test {
 
         assert_eq!(CreatorEarningsContract::balance(env.clone(), alice), 1_000);
         assert_eq!(CreatorEarningsContract::balance(env.clone(), bob), 2_000);
+    }
+
+    #[test]
+    fn batch_credit_too_large() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
+
+        let mut entries: Vec<(Address, i128, u32)> = Vec::new(&env);
+        for _ in 0..21 {
+            entries.push_back((Address::generate(&env), 1_000, 0));
+        }
+
+        let result = CreatorEarningsContract::batch_credit(env, entries);
+        assert_eq!(result, Err(EarningsError::BatchTooLarge));
+    }
+
+    #[test]
+    fn batch_credit_partial_failure_continues() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let charlie = Address::generate(&env);
+
+        let mut entries: Vec<(Address, i128, u32)> = Vec::new(&env);
+        entries.push_back((alice.clone(), 1_000, 0));
+        entries.push_back((bob.clone(), 0, 0)); // Invalid: amount = 0
+        entries.push_back((charlie.clone(), 2_000, 250));
+
+        let results = CreatorEarningsContract::batch_credit(env.clone(), entries).unwrap();
+
+        // Should have 3 results, with bob's failing (false).
+        assert_eq!(results.len(), 3);
+        assert_eq!(results.get(0), (alice.clone(), true));
+        assert_eq!(results.get(1), (bob.clone(), false));
+        assert_eq!(results.get(2), (charlie.clone(), true));
+
+        // Verify balances — only alice and charlie should have credits.
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), alice), 1_000);
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), bob), 0); // Not credited due to error
+        // charlie: 2_000 - (2_000 * 250 / 10_000) = 2_000 - 50 = 1_950
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), charlie), 1_950);
+    }
+
+    #[test]
+    fn batch_credit_empty_is_ok() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
+
+        let entries: Vec<(Address, i128, u32)> = Vec::new(&env);
+        let results = CreatorEarningsContract::batch_credit(env, entries).unwrap();
+        assert_eq!(results.len(), 0);
     }
 }
