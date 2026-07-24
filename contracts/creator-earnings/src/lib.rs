@@ -37,6 +37,8 @@ pub enum EarningsError {
     NotInitialised = 4,
     /// `batch_credit` was called with more than `MAX_BATCH_CREDIT` entries.
     BatchTooLarge = 5,
+    /// Contract is paused; credit() and claim() are disabled.
+    Paused = 6,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +52,8 @@ pub enum DataKey {
     Balance(Address),
     /// Platform fee recipient address.
     Platform,
+    /// Admin pause flag: if true, credit() and claim() return Paused error.
+    PausedState,
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +71,20 @@ impl CreatorEarningsContract {
         env.storage().instance().set(&DataKey::Platform, &platform);
     }
 
+    /// Admin-only: set or clear the pause flag.
+    /// When paused, credit() and claim() return Paused error.
+    /// balance() continues to work.
+    pub fn set_paused(env: Env, paused: bool) -> Result<(), EarningsError> {
+        let platform: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Platform)
+            .ok_or(EarningsError::NotInitialised)?;
+        platform.require_auth();
+        env.storage().instance().set(&DataKey::PausedState, &paused);
+        Ok(())
+    }
+
     /// Credit `amount` tokens to `creator`, splitting off `fee_bps` basis
     /// points to the platform.  The caller must have already transferred
     /// `amount` tokens to this contract address before calling.
@@ -78,6 +96,15 @@ impl CreatorEarningsContract {
         amount: i128,
         fee_bps: u32,
     ) -> Result<(i128, i128), EarningsError> {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedState)
+            .unwrap_or(false);
+        if paused {
+            return Err(EarningsError::Paused);
+        }
+
         if amount <= 0 {
             return Err(EarningsError::InvalidAmount);
         }
@@ -137,6 +164,15 @@ impl CreatorEarningsContract {
         creator: Address,
         token: Address,
     ) -> Result<i128, EarningsError> {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedState)
+            .unwrap_or(false);
+        if paused {
+            return Err(EarningsError::Paused);
+        }
+
         creator.require_auth();
 
         let key = DataKey::Balance(creator.clone());
@@ -483,5 +519,82 @@ mod test {
         let entries: Vec<(Address, i128, u32)> = Vec::new(&env);
         let results = CreatorEarningsContract::batch_credit(env, entries).unwrap();
         assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn set_paused_and_credit_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let platform = Address::generate(&env);
+        CreatorEarningsContract::init(env.clone(), platform.clone());
+
+        let creator = Address::generate(&env);
+
+        // Initially unpaused: credit should succeed.
+        let result = CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0);
+        assert!(result.is_ok());
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator.clone()), 1_000);
+
+        // Pause the contract.
+        let pause_result = CreatorEarningsContract::set_paused(env.clone(), true);
+        assert!(pause_result.is_ok());
+
+        // credit() should now return Paused error.
+        let result = CreatorEarningsContract::credit(env.clone(), creator.clone(), 500, 0);
+        assert_eq!(result, Err(EarningsError::Paused));
+
+        // balance() should still work while paused.
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator.clone()), 1_000);
+    }
+
+    #[test]
+    fn set_paused_and_claim_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let platform = Address::generate(&env);
+        CreatorEarningsContract::init(env.clone(), platform.clone());
+
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Seed a balance.
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(creator.clone()), &500_i128);
+
+        // Pause the contract.
+        CreatorEarningsContract::set_paused(env.clone(), true).unwrap();
+
+        // claim() should return Paused error.
+        let result = CreatorEarningsContract::claim(env.clone(), creator.clone(), token);
+        assert_eq!(result, Err(EarningsError::Paused));
+
+        // balance() should still work while paused.
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator), 500);
+    }
+
+    #[test]
+    fn unpause_allows_credit_and_claim() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let platform = Address::generate(&env);
+        CreatorEarningsContract::init(env.clone(), platform.clone());
+
+        let creator = Address::generate(&env);
+
+        // Pause.
+        CreatorEarningsContract::set_paused(env.clone(), true).unwrap();
+
+        // Verify credit is rejected.
+        let result = CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0);
+        assert_eq!(result, Err(EarningsError::Paused));
+
+        // Unpause.
+        CreatorEarningsContract::set_paused(env.clone(), false).unwrap();
+
+        // credit() should now succeed.
+        let result = CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0);
+        assert!(result.is_ok());
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator), 1_000);
     }
 }
