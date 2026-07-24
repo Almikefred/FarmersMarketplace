@@ -269,6 +269,8 @@ The script `contract/test-futurenet.sh` runs a full end-to-end test of the escro
 | 1 — Happy path | deposit → release | Farmer balance increases by `deposit − platform_fee` |
 | 2 — Dispute refund | deposit → open_dispute → resolve(buyer) | Buyer balance recovers the deposited amount |
 | 3 — Dispute to farmer | deposit → open_dispute → resolve(farmer) | Farmer balance increases |
+| 4 — Cooperative multisig | set_coop → deposit(royalty) → release | Cooperative treasury receives royalty amount |
+| 5 — Batch release | deposit(×2) → batch_release | Both escrows Released in single transaction |
 
 ### Prerequisites
 
@@ -288,11 +290,11 @@ cargo build --target wasm32-unknown-unknown --release
 ```
 
 The script:
-1. Generates four ephemeral Stellar keypairs (admin, buyer, farmer, arbitrator)
+1. Generates ephemeral Stellar keypairs (admin, buyer, farmer, arbitrator, fee-destination, cooperative-member, cooperative-treasury)
 2. Funds each via [Futurenet Friendbot](https://friendbot-futurenet.stellar.org)
 3. Deploys the contract to Futurenet and calls `initialize`
-4. Runs the three test flows above
-5. Asserts balance changes match expected amounts (±100 stroops tolerance for network fees)
+4. Runs the five test flows above
+5. Asserts balance changes match expected amounts (±100–1000 stroops tolerance for network fees)
 6. Exits **non-zero** on any failed assertion
 7. Cleans up ephemeral keys on exit
 
