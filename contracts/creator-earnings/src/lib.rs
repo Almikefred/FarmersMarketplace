@@ -54,6 +54,8 @@ pub enum DataKey {
     Platform,
     /// Admin pause flag: if true, credit() and claim() return Paused error.
     PausedState,
+    /// Lifetime total earnings for a creator (farmer_amount only, never reset).
+    LifetimeEarned(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -116,9 +118,14 @@ impl CreatorEarningsContract {
         let farmer_amount: i128 = amount - fee_amount;
 
         // Accumulate the creator's claimable balance.
-        let key = DataKey::Balance(creator.clone());
-        let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(prev + farmer_amount));
+        let balance_key = DataKey::Balance(creator.clone());
+        let prev: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        env.storage().persistent().set(&balance_key, &(prev + farmer_amount));
+
+        // Accumulate lifetime earnings (independent of claimable balance, never reset).
+        let lifetime_key = DataKey::LifetimeEarned(creator.clone());
+        let lifetime_prev: i128 = env.storage().persistent().get(&lifetime_key).unwrap_or(0);
+        env.storage().persistent().set(&lifetime_key, &(lifetime_prev + farmer_amount));
 
         Ok((farmer_amount, fee_amount))
     }
@@ -198,6 +205,16 @@ impl CreatorEarningsContract {
         env.storage()
             .persistent()
             .get(&DataKey::Balance(creator))
+            .unwrap_or(0)
+    }
+
+    /// Read-only: return the lifetime total earnings (farmer_amount only) for
+    /// `creator`. This counter is incremented on every credit() and never reset
+    /// by claim() — it reflects total earnings across all time.
+    pub fn lifetime_earned(env: Env, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LifetimeEarned(creator))
             .unwrap_or(0)
     }
 }
@@ -596,5 +613,69 @@ mod test {
         let result = CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0);
         assert!(result.is_ok());
         assert_eq!(CreatorEarningsContract::balance(env.clone(), creator), 1_000);
+    }
+
+    #[test]
+    fn lifetime_earned_tracks_total_credits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
+
+        let creator = Address::generate(&env);
+
+        // Initially zero.
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 0);
+
+        // Credit 1_000 with 0 fee → farmer gets 1_000, lifetime becomes 1_000.
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0).unwrap();
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 1_000);
+
+        // Credit 500 with 250 bps fee → farmer gets 487.5 (truncated to 487 due to integer division).
+        // 500 * 250 / 10_000 = 12.5 (truncated to 12), so farmer gets 500 - 12 = 488.
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 500, 250).unwrap();
+        // lifetime_earned should be 1_000 + 488 = 1_488.
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 1_488);
+    }
+
+    #[test]
+    fn lifetime_earned_survives_claim() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
+
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Credit 1_000.
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0).unwrap();
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 1_000);
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator.clone()), 1_000);
+
+        // Manually reset balance to 0 (simulates a successful claim).
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(creator.clone()), &0_i128);
+
+        // balance() is now zero, but lifetime_earned should be unchanged.
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator.clone()), 0);
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 1_000);
+    }
+
+    #[test]
+    fn lifetime_earned_accumulates_across_multiple_credits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
+
+        let creator = Address::generate(&env);
+
+        // Multiple credits with various fees.
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0).unwrap();
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0).unwrap();
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 500).unwrap(); // 50% fee
+
+        // Last credit: 1_000 * 500 / 10_000 = 50 fee, farmer gets 950.
+        // Total: 1_000 + 1_000 + 950 = 2_950.
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator), 2_950);
     }
 }
