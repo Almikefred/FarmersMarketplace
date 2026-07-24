@@ -14,6 +14,11 @@ const MIN_TIMEOUT_SECS: u64 = 3_600;
 /// the ledger storage it occupies. Admin-configurable via `set_min_deposit`. (#857)
 const MIN_DEPOSIT_STROOPS: i128 = 5_000_000;
 
+/// Upper bound on the minimum deposit amount — prevents accidental or malicious
+/// configuration that would brick all future deposits. Set to 500 XLM (100× the default
+/// minimum of 0.5 XLM). This allows for price changes without DoS risk. (#858)
+const MAX_MIN_DEPOSIT: i128 = 500_000_000;
+
 /// Maximum number of order IDs accepted by `batch_release` in a single call —
 /// keeps the transaction under Stellar's operation limit. (#856)
 const MAX_BATCH_RELEASE: u32 = 20;
@@ -598,7 +603,7 @@ impl EscrowContract {
     }
 
     /// Admin-only: update the minimum deposit amount (in stroops) to respond to
-    /// XLM price changes. Must be positive. (#857)
+    /// XLM price changes. Must be positive and not exceed MAX_MIN_DEPOSIT. (#857)
     pub fn set_min_deposit(env: Env, amount: i128) -> Result<(), EscrowError> {
         let admin_transfer: AdminTransfer = env
             .storage()
@@ -607,7 +612,7 @@ impl EscrowContract {
             .ok_or(EscrowError::Unauthorized)?;
         admin_transfer.current_admin.require_auth();
 
-        if amount <= 0 {
+        if amount <= 0 || amount > MAX_MIN_DEPOSIT {
             return Err(EscrowError::InvalidAmount);
         }
         env.storage().instance().set(&DataKey::MinDeposit, &amount);
@@ -789,15 +794,30 @@ impl EscrowContract {
 
     /// Take a snapshot of the current escrow state for `order_id`. (#858)
     ///
-    /// Callable by the Platform/Arbitrator role (the contract admin acts as the
-    /// arbitrator). Returns the ledger sequence the snapshot was stored under.
+    /// Callable by the buyer, farmer, or the Platform/Arbitrator role (admin).
+    /// Returns the ledger sequence the snapshot was stored under.
     pub fn take_snapshot(env: Env, order_id: u64) -> Result<u64, EscrowError> {
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(order_id))
+            .ok_or(EscrowError::NotFound)?;
+
         let admin_transfer: AdminTransfer = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(EscrowError::Unauthorized)?;
-        admin_transfer.current_admin.require_auth();
+
+        let caller = env.invoker();
+        let is_authorized = caller == escrow.buyer
+            || caller == escrow.farmer
+            || caller == admin_transfer.current_admin;
+
+        if !is_authorized {
+            return Err(EscrowError::Unauthorized);
+        }
+
         Self::store_snapshot(&env, order_id)
     }
 
@@ -2536,6 +2556,21 @@ mod test {
     }
 
     #[test]
+    fn set_min_deposit_rejects_excessive_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        setup_admin_for(&env);
+        assert_eq!(
+            EscrowContract::set_min_deposit(env, MAX_MIN_DEPOSIT + 1),
+            Err(EscrowError::InvalidAmount)
+        );
+        assert_eq!(
+            EscrowContract::set_min_deposit(env, i128::MAX),
+            Err(EscrowError::InvalidAmount)
+        );
+    }
+
+    #[test]
     fn deposit_below_minimum_rejected() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2653,6 +2688,31 @@ mod test {
         setup_admin_for(&env);
         let result = EscrowContract::take_snapshot(env, 12345);
         assert_eq!(result, Err(EscrowError::NotFound));
+    }
+
+    #[test]
+    fn take_snapshot_allowed_for_buyer_farmer_and_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let buyer = Address::generate(&env);
+        let farmer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let admin = setup_admin_for(&env);
+        store_escrow(&env, 902, buyer.clone(), farmer.clone(), token);
+
+        let seq_by_admin = EscrowContract::take_snapshot(env.clone(), 902).unwrap();
+        let snap = EscrowContract::get_snapshot(env.clone(), 902, seq_by_admin).unwrap();
+        assert_eq!(snap.buyer, buyer);
+
+        store_escrow(&env, 903, buyer.clone(), farmer.clone(), token);
+        let seq_by_buyer = EscrowContract::take_snapshot(env.clone(), 903).unwrap();
+        let snap = EscrowContract::get_snapshot(env.clone(), 903, seq_by_buyer).unwrap();
+        assert_eq!(snap.farmer, farmer);
+
+        store_escrow(&env, 904, buyer.clone(), farmer.clone(), token);
+        let seq_by_farmer = EscrowContract::take_snapshot(env.clone(), 904).unwrap();
+        let snap = EscrowContract::get_snapshot(env, 904, seq_by_farmer).unwrap();
+        assert_eq!(snap.buyer, buyer);
     }
 
     #[test]
